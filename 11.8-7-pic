@@ -600,9 +600,11 @@ def login_all_accounts():
                             close_announcement()
                         else:
                             write_login_log("無公告，不需關閉")
-                        # dict patch: 用 hwnd 當 key，value 記帳號資訊
-                        if hwnd not in windows_handles:
-                            windows_handles[hwnd] = {"username": account["username"]}
+                        # 新增 last_login_time
+                        windows_handles[hwnd] = {
+                            "username": account["username"],
+                            "last_login_time": time.time()
+                        }
                         success = True
                     else:
                         write_login_log(f"{account['username']} 登入失敗，重試第{retry + 1}次")
@@ -693,12 +695,10 @@ def start_window_rotation(windows):
     this_id = uuid.uuid4()
     rotation_thread_id = this_id
 
-    # ====== 卡死模板比對區塊 (只加一次) ======
     crash_template = cv2.imread("selected_area.png", cv2.IMREAD_GRAYSCALE)
     crash_template_shape = crash_template.shape if crash_template is not None else None
     crash_last_check = {"time": 0, "result": False}
 
-    # 讓 get_account_from_json 作用在 rotation_task 內
     def get_account_from_json(username):
         with open('accounts.json', 'r', encoding='utf-8') as f:
             accounts = json.load(f)
@@ -707,24 +707,20 @@ def start_window_rotation(windows):
                 return acc
         return None
 
-    def is_window_crashed(interval=3):
-        now = time.time()
-        if now - crash_last_check.get("time", 0) < interval:
-            return crash_last_check.get("result", False)
+    def is_window_crashed():
+        # 抓取畫面區域
         x, y, w, h = 6, 25, 791, 591
         screenshot = ImageGrab.grab(bbox=(x, y, x + w, y + h))
-        img_gray = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2GRAY)
-        if img_gray.shape != crash_template_shape:
-            img_gray = cv2.resize(img_gray, (crash_template_shape[1], crash_template_shape[0]))
-        res = cv2.matchTemplate(img_gray, crash_template, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, _ = cv2.minMaxLoc(res)
-        result = max_val >= 0.98       # 門檻根據你實測調整
-        print(f"[DEBUG] 卡死模板比對 max_val={max_val:.3f}，判定crash={result}")
-        write_login_log(f"卡死模板比對 max_val={max_val:.3f}，判定crash={result}")
-        crash_last_check["time"] = now
-        crash_last_check["result"] = result
-        return result
-        # ====== END ======
+        img = np.array(screenshot)
+        # 計算每個像素R,G,B的標準差
+        stddev = np.std(img, axis=2)
+        # 整張圖的平均標準差
+        mean_stddev = np.mean(stddev)
+        # 一般全灰畫面mean_stddev會很低(<4~6)，正常遊戲畫面會很高
+        print(f"[DEBUG] 畫面顏色標準差 mean_stddev={mean_stddev:.2f}")
+        write_login_log(f"畫面顏色標準差 mean_stddev={mean_stddev:.2f}")
+        # 你可以自己用log觀察，初步建議門檻設 6
+        return mean_stddev < 6
 
     def rotation_task():
         global rotation_running, rotation_countdown, windows_handles, rotation_thread_id
@@ -740,47 +736,51 @@ def start_window_rotation(windows):
             if idx >= len(hwnd_keys):
                 idx = 0
             hwnd = hwnd_keys[idx]
-            if event_processing.is_set():
-                time.sleep(0.1)
-                if not rotation_running or rotation_thread_id != this_id:
-                    break
-                continue
-            rotation_paused.wait()
-            if not rotation_running or rotation_thread_id != this_id:
-                break
-
-            # ===== 卡死判斷區塊（在 bring_foreground 前）======
-            try:
-                if is_window_crashed():
-                    acc_brief = windows_handles[hwnd]
-                    username = acc_brief.get('username', '')
-                    write_login_log(f"偵測到帳號 {username} 畫面卡死，準備自動重啟該帳號")
-                    close_window(hwnd)
-                    del windows_handles[hwnd]
-                    time.sleep(2)
-                    try:
-                        acc = get_account_from_json(username)
-                        if acc is None:
-                            write_login_log(f"自動重啟帳號 {username} 失敗: 找不到帳號資料於 accounts.json")
-                        else:
-                            new_hwnd = login_account_and_get_hwnd(acc)
-                            windows_handles[new_hwnd] = acc_brief
-                            write_login_log(f"已自動重啟帳號 {acc['username']}")
-                    except Exception as e:
-                        write_login_log(f"自動重啟帳號 {username} 失敗: {e}")
-                    idx = (idx + 1) % len(hwnd_keys)
-                    with rotation_countdown_lock:
-                        rotation_countdown = rotation_interval
-                    continue
-            except Exception as e:
-                write_login_log(f"卡死檢查異常: {e}")
-            # ===== END ======
-
+            acc_brief = windows_handles[hwnd]
+            last_login_time = acc_brief.get("last_login_time", 0)
+            cooldown = 30  # 冷卻期秒數
+            # 切到前景
             try:
                 bring_foreground(hwnd)
-                write_scan_log(f"切換到第{idx + 1}個帳號視窗 {windows_handles[hwnd].get('username','')}")
+                write_scan_log(f"切換到第{idx + 1}個帳號視窗 {acc_brief.get('username','')}")
             except Exception as e:
                 write_scan_log(f"輪換視窗失敗: {e}")
+                idx = (idx + 1) % len(hwnd_keys)
+                with rotation_countdown_lock:
+                    rotation_countdown = rotation_interval
+                continue
+
+            # 只判斷一次當掉，不是一直判斷
+            # 若還在冷卻期則跳過判斷
+            if time.time() - last_login_time < cooldown:
+                write_login_log(f"{acc_brief['username']} 登入冷卻期內，跳過卡死判斷")
+            else:
+                time.sleep(2.5)  # 等畫面穩定後再判斷
+                try:
+                    if is_window_crashed():
+                        write_login_log(f"偵測到帳號 {acc_brief['username']} 畫面卡死，準備自動重啟該帳號")
+                        close_window(hwnd)
+                        del windows_handles[hwnd]
+                        time.sleep(2)
+                        try:
+                            acc = get_account_from_json(acc_brief['username'])
+                            if acc is None:
+                                write_login_log(f"自動重啟帳號 {acc_brief['username']} 失敗: 找不到帳號資料於 accounts.json")
+                            else:
+                                new_hwnd = login_account_and_get_hwnd(acc)
+                                windows_handles[new_hwnd] = acc_brief
+                                windows_handles[new_hwnd]["last_login_time"] = time.time()
+                                write_login_log(f"已自動重啟帳號 {acc['username']}")
+                        except Exception as e:
+                            write_login_log(f"自動重啟帳號 {acc_brief['username']} 失敗: {e}")
+                        idx = (idx + 1) % len(hwnd_keys)
+                        with rotation_countdown_lock:
+                            rotation_countdown = rotation_interval
+                        continue
+                except Exception as e:
+                    write_login_log(f"卡死檢查異常: {e}")
+
+            # 倒數輪巡等待
             idx = (idx + 1) % len(hwnd_keys)
             with rotation_countdown_lock:
                 rotation_countdown = rotation_interval
