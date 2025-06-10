@@ -1,0 +1,114 @@
+def start_window_rotation(windows):
+    global rotation_running, rotation_thread_id, rotation_thread, windows_handles
+    stop_window_rotation()
+    this_id = uuid.uuid4()
+    rotation_thread_id = this_id
+
+    def rotation_task():
+        global rotation_running, rotation_countdown, windows_handles, rotation_thread_id
+        idx = 0
+        rotation_running = True
+        with rotation_countdown_lock:
+            rotation_countdown = rotation_interval
+
+        while rotation_running and windows_handles and rotation_thread_id == this_id:
+            clean_invalid_handles()
+            if not windows_handles:
+                break
+            if idx >= len(windows_handles):
+                idx = 0
+            wh = windows_handles[idx]
+            hwnd = wh["hwnd"]
+            account = wh["account"]
+
+            # 1. 先檢查視窗「沒有回應」
+            if is_window_hung(hwnd):
+                wh["retry"] += 1
+                if wh["retry"] > 5:
+                    write_login_log(f"{account['username']} 視窗沒有回應已超過5次，不再自動重登")
+                    windows_handles.pop(idx)
+                    continue
+                write_login_log(f"{account['username']} 視窗沒有回應，嘗試第{wh['retry']}次重登")
+                close_window(hwnd)
+                try:
+                    new_hwnd = login_account_and_get_hwnd(account)
+                    windows_handles[idx] = {"hwnd": new_hwnd, "account": account, "retry": wh["retry"]}
+                    write_login_log(f"✅ 已自動重登帳號：{account['username']}")
+                except Exception as e:
+                    write_login_log(f"❌ 自動重登帳號失敗：{account['username']}，錯誤：{e}")
+                    continue
+                time.sleep(login_delay_seconds)
+                continue
+
+            # 2. 再檢查畫面是否卡死（快取hash/像素比對）
+            match, score = is_crash_like(hwnd, threshold=0.8)
+            if match:
+                wh["retry"] += 1
+                if wh["retry"] > 5:
+                    write_login_log(f"{account['username']} 畫面卡死（相似度={score:.2f}）已超過5次，不再自動重登")
+                    windows_handles.pop(idx)
+                    continue
+                write_login_log(f"{account['username']} 畫面卡死（相似度={score:.2f}），嘗試第{wh['retry']}次重登")
+                close_window(hwnd)
+                try:
+                    new_hwnd = login_account_and_get_hwnd(account)
+                    windows_handles[idx] = {"hwnd": new_hwnd, "account": account, "retry": wh["retry"]}
+                    write_login_log(f"✅ 已自動重登帳號：{account['username']}")
+                except Exception as e:
+                    write_login_log(f"❌ 自動重登帳號失敗：{account['username']}，錯誤：{e}")
+                    continue
+                time.sleep(login_delay_seconds)
+                continue
+            else:
+                wh["retry"] = 0
+
+            if event_processing.is_set():
+                time.sleep(0.1)
+                if not rotation_running or rotation_thread_id != this_id:
+                    break
+                continue
+
+            rotation_paused.wait()
+            if not rotation_running or rotation_thread_id != this_id:
+                break
+
+            try:
+                bring_foreground(hwnd)
+                write_scan_log(f"切換到第{idx + 1}個帳號視窗（{account['username']}）")
+            except Exception as e:
+                write_scan_log(f"輪換視窗失敗: {e}")
+
+            idx = (idx + 1) % len(windows_handles)
+
+            with rotation_countdown_lock:
+                rotation_countdown = rotation_interval
+
+            while True:
+                with rotation_countdown_lock:
+                    if (rotation_countdown <= 0 or
+                        not rotation_running or
+                        event_processing.is_set() or
+                        rotation_thread_id != this_id):
+                        break
+                    current_rotation = rotation_countdown
+
+                try:
+                    app.after(0, app.set_rotation_timer_label, current_rotation)
+                except Exception:
+                    pass
+
+                for _ in range(10):
+                    if not rotation_running or rotation_thread_id != this_id:
+                        break
+                    time.sleep(0.1)
+                with rotation_countdown_lock:
+                    rotation_countdown -= 1
+
+        try:
+            app.after(0, app.set_rotation_timer_label, 0)
+        except Exception:
+            pass
+
+    t = threading.Thread(target=rotation_task, daemon=True)
+    rotation_thread = t
+    t.start()
