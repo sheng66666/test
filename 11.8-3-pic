@@ -24,6 +24,7 @@ import uuid
 import traceback
 import functools
 from collections import deque
+import psutil  # <--- 新增
 
 # ===== 簡化配色方案 =====
 COLORS = {
@@ -77,16 +78,11 @@ except Exception as e:
 # ===== 全域變數 =====
 event_templates = {}
 
-#  1.定義遊戲路徑預設值
 DEFAULT_GAME_EXE_PATH = r"C:\Users\jinyong\Downloads\JYOnline_TW\maina\loginp.exe"
 DEFAULT_GAME_EXE_PARAMS = "123"
 
-# 2. 設定檔路徑
 BASE_DIR = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(__file__)
 SETTINGS_FILE = os.path.join(BASE_DIR, "game_settings.json")
-
-
-
 ACCOUNTS_CONFIG = os.path.join(BASE_DIR, "accounts.json")
 LOGIN_WINDOW_TITLE_REGEX = "JYOnline"
 SERVER_CONFIRM_COORDS = (322, 548)
@@ -110,24 +106,23 @@ rotation_running = False
 restart_enabled = False
 schedule_enabled = True
 
-# 計時與間隔設定
 rotation_interval = 15
 restart_minutes = 20
 login_delay_seconds = 5
 
-# 執行狀態與計數器
 rotation_thread_id = None
 rotation_thread = None
 last_scan_image_hash = None
 rotation_countdown = 0
 restart_countdown = restart_minutes * 60
 
-# 集合與列表
 accounts = []
 vars_checkbox = []
+
+# ===== 新增帳號視窗對應結構 =====
+# windows_handles: List[dict]，每一項為 {"hwnd": hwnd, "account": account}
 windows_handles = []
 
-# 事件與鎖
 rotation_paused = threading.Event()
 rotation_paused.set()
 event_processing = threading.Event()
@@ -137,7 +132,6 @@ restart_countdown_lock = threading.Lock()
 restart_thread_stop_event = threading.Event()
 login_lock = threading.Lock()
 
-# 座標與事件對應
 option_coordinates = {
     1: (420, 307),
     2: (420, 325),
@@ -170,8 +164,6 @@ schedule_times = {
 }
 
 # ===== 工具函式 =====
-
-# 3. 定義遊戲路徑設定檔的讀寫函式
 def load_game_settings():
     if os.path.exists(SETTINGS_FILE):
         try:
@@ -188,13 +180,11 @@ def save_game_settings_to_file(path, params):
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump({"game_exe_path": path, "game_exe_params": params}, f, ensure_ascii=False, indent=2)
 
-# 4. 這時候才可以呼叫 load_game_settings
 game_settings = load_game_settings()
 GAME_EXE_PATH = game_settings["game_exe_path"]
 GAME_EXE_PARAMS = game_settings["game_exe_params"]
 
 def get_game_client_area_rect():
-    """回傳遊戲客戶端區域座標"""
     windows = gw.getWindowsWithTitle(LOGIN_WINDOW_TITLE_REGEX)
     if not windows:
         return (DEFAULT_GAME_X, DEFAULT_GAME_Y, DEFAULT_GAME_W, DEFAULT_GAME_H)
@@ -255,9 +245,46 @@ def key_press(vk_code):
     KEYEVENTF_KEYUP = 0x0002
     ctypes.windll.user32.keybd_event(vk_code, 0, 0, 0)
     ctypes.windll.user32.keybd_event(vk_code, 0, KEYEVENTF_KEYUP, 0)
-# ===== 圖片快取與掃描功能 =====
-import functools
-from collections import deque
+
+def is_window_valid(hwnd):
+    try:
+        return win32gui.IsWindow(hwnd) and win32gui.IsWindowVisible(hwnd)
+    except Exception:
+        return False
+
+# ===== 新增：判斷視窗是否無回應 =====
+def is_window_hung(hwnd):
+    try:
+        # 取得 hwnd 對應的 process id
+        tid, pid = win32process.GetWindowThreadProcessId(hwnd)
+        p = psutil.Process(pid)
+        # psutil.STATUS_NOT_RESPONDING 只在 Windows 上有
+        if hasattr(p, 'status'):
+            if p.status() == psutil.STATUS_NOT_RESPONDING:
+                return True
+        # 進階：用 win32gui.SendMessageTimeout 測試視窗反應
+        SMTO_ABORTIFHUNG = 0x0002
+        result = ctypes.windll.user32.SendMessageTimeoutW(
+            hwnd, win32con.WM_NULL, 0, 0, SMTO_ABORTIFHUNG, 1000, ctypes.byref(ctypes.c_ulong())
+        )
+        if result == 0:
+            return True
+        return False
+    except Exception:
+        return True
+
+def clean_invalid_handles():
+    global windows_handles
+    windows_handles = [
+        wh for wh in windows_handles if is_window_valid(wh["hwnd"])
+    ]
+
+def close_window(hwnd):
+    try:
+        win32gui.PostMessage(hwnd, 0x0010, 0, 0)
+        write_login_log(f"已關閉視窗 hwnd={hwnd}")
+    except Exception as e:
+        write_login_log(f"關閉視窗失敗 hwnd={hwnd}: {e}")
 
 class ImageCache:
     """圖片處理快取管理器"""
@@ -413,22 +440,8 @@ def login_account_and_get_hwnd(account):
     write_login_log(f"{account['username']} 登入中")
     return win.handle
 
-def is_window_valid(hwnd):
-    try:
-        return win32gui.IsWindow(hwnd) and win32gui.IsWindowVisible(hwnd)
-    except Exception:
-        return False
 
-def clean_invalid_handles():
-    global windows_handles
-    windows_handles = [hwnd for hwnd in windows_handles if is_window_valid(hwnd)]
 
-def close_window(hwnd):
-    try:
-        win32gui.PostMessage(hwnd, 0x0010, 0, 0)
-        write_login_log(f"已關閉視窗 hwnd={hwnd}")
-    except Exception as e:
-        write_login_log(f"關閉視窗失敗 hwnd={hwnd}: {e}")
 
 def write_login_log(message):
     """優化後的登入日誌寫入"""
@@ -1550,45 +1563,6 @@ class AccountManagerApp(ctk.CTk):
         rotation_running = False
         restart_thread_stop_event.set()
         self.destroy()
-
-# ===== 格式化倒數時間 =====
-def format_countdown(seconds):
-    """格式化倒數時間顯示"""
-    seconds = int(max(seconds, 0))
-    days = seconds // 86400
-    hours = (seconds % 86400) // 3600
-    minutes = (seconds % 3600) // 60
-    sec = seconds % 60
-    return f"{days}天{hours:02d}:{minutes:02d}:{sec:02d}"
-
-# ===== 帳號資料儲存/載入 =====
-def save_accounts(filepath=ACCOUNTS_CONFIG):
-    """儲存帳號資料"""
-    for idx, acc in enumerate(accounts):
-        if idx < len(vars_checkbox):
-            acc["enabled"] = vars_checkbox[idx].get()
-    try:
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(accounts, f, ensure_ascii=False, indent=2)
-        write_login_log(f"帳號已儲存")
-    except Exception as e:
-        write_login_log(f"儲存帳號失敗: {e}")
-
-def load_accounts(filepath=ACCOUNTS_CONFIG):
-    """載入帳號資料"""
-    global accounts
-    if os.path.exists(filepath):
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                accounts[:] = json.load(f)
-        except Exception as e:
-            accounts[:] = []
-            write_login_log(f"載入帳號失敗: {e}")
-    else:
-        accounts[:] = []
-    
-    if hasattr(app, "refresh_account_list"):
-        app.refresh_account_list()
 
 # ===== 主程式入口 =====
 if __name__ == "__main__":
