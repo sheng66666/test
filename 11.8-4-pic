@@ -255,23 +255,10 @@ def is_window_valid(hwnd):
 # ===== 新增：判斷視窗是否無回應 =====
 def is_window_hung(hwnd):
     try:
-        # 取得 hwnd 對應的 process id
-        tid, pid = win32process.GetWindowThreadProcessId(hwnd)
-        p = psutil.Process(pid)
-        # psutil.STATUS_NOT_RESPONDING 只在 Windows 上有
-        if hasattr(p, 'status'):
-            if p.status() == psutil.STATUS_NOT_RESPONDING:
-                return True
-        # 進階：用 win32gui.SendMessageTimeout 測試視窗反應
-        SMTO_ABORTIFHUNG = 0x0002
-        result = ctypes.windll.user32.SendMessageTimeoutW(
-            hwnd, win32con.WM_NULL, 0, 0, SMTO_ABORTIFHUNG, 1000, ctypes.byref(ctypes.c_ulong())
-        )
-        if result == 0:
-            return True
-        return False
+        import win32gui
+        return win32gui.IsHungAppWindow(hwnd)
     except Exception:
-        return True
+        return False
 
 def clean_invalid_handles():
     global windows_handles
@@ -604,12 +591,11 @@ def login_all_accounts():
         return
     clean_invalid_handles()
     rotation_paused.clear()
-
     with login_lock:
         global windows_handles, login_stopped, restart_countdown
         login_stopped = False
+        windows_handles = []
         selected_accounts = [accounts[i] for i in range(len(accounts)) if i < len(vars_checkbox) and vars_checkbox[i].get()]
-        
         for account in selected_accounts:
             retry = 0
             success = False
@@ -619,14 +605,12 @@ def login_all_accounts():
                     if hwnd:
                         close_window(hwnd)
                     hwnd = login_account_and_get_hwnd(account)
-                    
                     for _ in range(login_delay_seconds):
                         if login_stopped:
                             break
                         time.sleep(1)
                     if login_stopped:
                         break
-                        
                     if is_chat_bar_visible():
                         write_login_log(f"{account['username']} 登入成功")
                         if recognize_announcement and detect_announcement():
@@ -634,8 +618,7 @@ def login_all_accounts():
                             close_announcement()
                         else:
                             write_login_log("無公告，不需關閉")
-                        if hwnd not in windows_handles:
-                            windows_handles.append(hwnd)
+                        windows_handles.append({"hwnd": hwnd, "account": account, "retry": 0})
                         success = True
                     else:
                         write_login_log(f"{account['username']} 登入失敗，重試第{retry + 1}次")
@@ -657,11 +640,9 @@ def login_all_accounts():
             if login_stopped:
                 write_login_log("已停止自動登入流程")
                 break
-
     if windows_handles and not login_stopped:
         start_window_rotation(windows_handles)
         write_login_log("所有帳號登入流程結束，開始輪流前移視窗！")
-    
     with restart_countdown_lock:
         restart_countdown = restart_minutes * 60
     rotation_paused.set()
@@ -736,7 +717,30 @@ def start_window_rotation(windows):
                 break
             if idx >= len(windows_handles):
                 idx = 0
-            hwnd = windows_handles[idx]
+            wh = windows_handles[idx]
+            hwnd = wh["hwnd"]
+            account = wh["account"]
+
+            # 檢查工作管理員狀態是否為沒有回應
+            if is_window_hung(hwnd):
+                wh["retry"] += 1
+                if wh["retry"] > 5:
+                    write_login_log(f"{account['username']} 無回應已超過5次，不再自動重登")
+                    windows_handles.pop(idx)
+                    continue
+                write_login_log(f"{account['username']} 視窗沒有回應，嘗試第{wh['retry']}次重登")
+                close_window(hwnd)
+                try:
+                    new_hwnd = login_account_and_get_hwnd(account)
+                    windows_handles[idx] = {"hwnd": new_hwnd, "account": account, "retry": wh["retry"]}
+                    write_login_log(f"✅ 已自動重登帳號：{account['username']}")
+                except Exception as e:
+                    write_login_log(f"❌ 自動重登帳號失敗：{account['username']}，錯誤：{e}")
+                    continue
+                time.sleep(login_delay_seconds)
+                continue
+            else:
+                wh["retry"] = 0
 
             if event_processing.is_set():
                 time.sleep(0.1)
@@ -750,7 +754,7 @@ def start_window_rotation(windows):
 
             try:
                 bring_foreground(hwnd)
-                write_scan_log(f"切換到第{idx + 1}個帳號視窗")
+                write_scan_log(f"切換到第{idx + 1}個帳號視窗（{account['username']}）")
             except Exception as e:
                 write_scan_log(f"輪換視窗失敗: {e}")
 
@@ -806,10 +810,10 @@ def restart_timer_thread():
             else:
                 if restart_countdown <= 0:
                     write_login_log(f"自動重啟：{restart_minutes}分鐘到，關閉遊戲並重新登入")
-                    current_handles = windows_handles.copy()
-                    for hwnd in current_handles:
-                        close_window(hwnd)
-                    time.sleep(5)
+                    for wh in windows_handles[:]:
+                        close_window(wh["hwnd"])
+                    windows_handles.clear()
+                    time.sleep(1)  # 只等1秒就開新遊戲
                     if not login_lock.locked():
                         threading.Thread(target=login_all_accounts, daemon=True).start()
                     restart_countdown = restart_minutes * 60
@@ -821,6 +825,7 @@ def restart_timer_thread():
             app.after(0, app.set_restart_timer_label, current_count)
         except Exception:
             pass
+
 
 def schedule_timer_thread():
     while True:
@@ -857,9 +862,10 @@ def schedule_timer_thread():
                     pass
                 if current_delta <= 0:
                     write_login_log(f"排程時間到，關閉遊戲並重新登入")
-                    for hwnd in windows_handles:
-                        close_window(hwnd)
-                    time.sleep(5)
+                    for wh in windows_handles[:]:
+                        close_window(wh["hwnd"])
+                    windows_handles.clear()
+                    time.sleep(1)
                     login_all_accounts()
                     time.sleep(60)
             else:
