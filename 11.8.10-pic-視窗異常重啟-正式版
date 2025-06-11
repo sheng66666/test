@@ -681,6 +681,19 @@ def stop_show_scan_region_box():
     global scan_box_running, stop_event
     stop_event.set()
 
+def is_window_abnormal_once():
+    """
+    單次判斷指定區域畫面標準差是否異常。
+    回傳 (異常:bool, mean_stddev:float)
+    """
+    x, y, w, h = 6, 25, 791, 591
+    screenshot = ImageGrab.grab(bbox=(x, y, x + w, y + h))
+    img = np.array(screenshot)
+    stddev = np.std(img, axis=2)
+    mean_stddev = np.mean(stddev)
+    return mean_stddev < 6, mean_stddev
+
+
 # ===== 輪巡功能 =====
 def start_window_rotation(windows):
     import numpy as np
@@ -741,9 +754,13 @@ def start_window_rotation(windows):
         global rotation_running, rotation_countdown, windows_handles, rotation_thread_id
         idx = 0
         rotation_running = True
+        # abnormal_streak_dict: 用帳號記錄異常次數，不會因倒數迴圈每次重設
+        abnormal_streak_dict = {}
         with rotation_countdown_lock:
             rotation_countdown = rotation_interval
         while rotation_running and windows_handles and rotation_thread_id == this_id:
+            if not rotation_running or rotation_thread_id != this_id:
+                break
             clean_invalid_handles()
             if not windows_handles:
                 break
@@ -755,7 +772,11 @@ def start_window_rotation(windows):
 
             # 切到前景前，等待事件處理完畢
             while event_processing.is_set():
+                if not rotation_running or rotation_thread_id != this_id:
+                    break
                 time.sleep(0.1)
+            if not rotation_running or rotation_thread_id != this_id:
+                break
             try:
                 bring_foreground(hwnd)
                 write_scan_log(f"切換到第{idx + 1}個帳號視窗 {acc_brief.get('username','')}")
@@ -766,18 +787,18 @@ def start_window_rotation(windows):
                     rotation_countdown = rotation_interval
                 continue
 
-            # 進入倒數等待，這段同時做異常判斷
             idx = (idx + 1) % len(hwnd_keys)
             with rotation_countdown_lock:
                 rotation_countdown = rotation_interval
 
-            abnormal_streak = 0
-            mean_stddev = 0
             abnormal_threshold = 3  # 連續3次異常
-            countdown = rotation_interval  # 例如輪巡間隔15秒
+            countdown = rotation_interval
+            username = acc_brief.get('username', 'unknown')
+            abnormal_streak = abnormal_streak_dict.get(username, 0)
 
             while countdown > 0:
-                # 每秒進行一次異常判斷
+                if not rotation_running or rotation_thread_id != this_id:
+                    break
                 try:
                     abnormal, mean_stddev = is_window_abnormal_once()
                 except Exception as e:
@@ -786,11 +807,11 @@ def start_window_rotation(windows):
 
                 if abnormal:
                     abnormal_streak += 1
+                    abnormal_streak_dict[username] = abnormal_streak
                     if abnormal_streak >= abnormal_threshold:
                         try:
                             os.makedirs("crash", exist_ok=True)
                             timestamp = time.strftime('%Y%m%d_%H%M%S')
-                            username = acc_brief.get('username', 'unknown')
                             filename = f"crash/{username}_{timestamp}.png"
                             crash_img = ImageGrab.grab()
                             crash_img.save(filename)
@@ -803,27 +824,30 @@ def start_window_rotation(windows):
                         if hwnd in windows_handles:
                             del windows_handles[hwnd]
                         time.sleep(2)
+                        # 重設異常計數
+                        abnormal_streak_dict[username] = 0
                         # 暫停輪巡，重登
                         new_hwnd = relogin_account(acc_brief)
                         if new_hwnd is not None:
-                            windows_handles[new_hwnd] = {"username": acc_brief['username']}
+                            windows_handles[new_hwnd] = {"username": username}
                         write_login_log("重登流程結束，恢復輪巡")
                         start_window_rotation(list(windows_handles.keys()))
-                        return  # 停止目前這個輪巡thread
+                        return
                 else:
                     abnormal_streak = 0
+                    abnormal_streak_dict[username] = 0
 
-                # 每秒更新倒數
                 try:
                     app.after(0, app.set_rotation_timer_label, countdown)
                 except Exception:
                     pass
-                # 如果事件觸發，暫停倒數
                 for _ in range(10):
                     if not rotation_running or rotation_thread_id != this_id:
                         break
                     if event_processing.is_set():
                         while event_processing.is_set():
+                            if not rotation_running or rotation_thread_id != this_id:
+                                break
                             time.sleep(0.1)
                     time.sleep(0.1)
                 with rotation_countdown_lock:
@@ -840,8 +864,13 @@ def start_window_rotation(windows):
     t.start()
 
 def stop_window_rotation():
-    global rotation_running
+    global rotation_running, rotation_thread_id
     rotation_running = False
+    rotation_thread_id = None
+    try:
+        app.after(0, app.set_rotation_timer_label, 0)
+    except Exception:
+        pass
     rotation_paused.set()
 
 # ===== 計時器線程 =====
