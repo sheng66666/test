@@ -703,16 +703,47 @@ def start_window_rotation(windows):
         return None
 
     def is_window_abnormal():
-        # 抓取畫面區域
         x, y, w, h = 6, 25, 791, 591
         screenshot = ImageGrab.grab(bbox=(x, y, x + w, y + h))
         img = np.array(screenshot)
-        # 計算每個像素R,G,B的標準差
         stddev = np.std(img, axis=2)
-        # 整張圖的平均標準差
         mean_stddev = np.mean(stddev)
-        # 全灰畫面mean_stddev會很低(<6)，正常畫面會很高
         return mean_stddev < 6, mean_stddev
+
+    def relogin_account(acc_brief):
+        acc = get_account_from_json(acc_brief['username'])
+        if acc is None:
+            write_login_log(f"自動重登帳號 {acc_brief['username']} 失敗: 找不到帳號資料於 accounts.json")
+            return None
+        retry = 0
+        success = False
+        new_hwnd = None
+        while retry < 5 and not success:
+            try:
+                if new_hwnd:
+                    close_window(new_hwnd)
+                new_hwnd = login_account_and_get_hwnd(acc)
+                for _ in range(login_delay_seconds):
+                    time.sleep(1)
+                if is_chat_bar_visible():
+                    write_login_log(f"已自動重登帳號 {acc['username']}")
+                    success = True
+                    return new_hwnd
+                else:
+                    write_login_log(f"自動重登帳號 {acc['username']} 失敗，重試第{retry+1}次")
+                    close_window(new_hwnd)
+                    retry += 1
+                    for _ in range(1):
+                        time.sleep(1)
+            except Exception as e:
+                write_login_log(f"自動重登帳號 {acc_brief['username']} 登入異常: {e}")
+                if new_hwnd:
+                    close_window(new_hwnd)
+                retry += 1
+                for _ in range(1):
+                    time.sleep(1)
+        write_login_log(f"自動重登帳號 {acc_brief['username']} 失敗，已達最大重試次數")
+        return None
 
     def rotation_task():
         global rotation_running, rotation_countdown, windows_handles, rotation_thread_id
@@ -741,37 +772,30 @@ def start_window_rotation(windows):
                     rotation_countdown = rotation_interval
                 continue
 
-            # 等畫面穩定
-            time.sleep(2.5)
-
-            # 檢查畫面是否異常，異常就重登
+            # 2秒後判斷是否異常
+            time.sleep(2)
             try:
                 abnormal, mean_stddev = is_window_abnormal()
-                if abnormal:
-                    write_login_log(f"[警告] 帳號 {acc_brief['username']} 畫面異常(全灰?)，標準差={mean_stddev:.2f}，即將自動重登")
-                    # 關閉該視窗
-                    close_window(hwnd)
-                    del windows_handles[hwnd]
-                    time.sleep(2)
-                    # 取得帳號資料重登
-                    acc = get_account_from_json(acc_brief['username'])
-                    if acc is None:
-                        write_login_log(f"自動重登帳號 {acc_brief['username']} 失敗: 找不到帳號資料於 accounts.json")
-                    else:
-                        new_hwnd = login_account_and_get_hwnd(acc)
-                        windows_handles[new_hwnd] = {"username": acc_brief['username']}
-                        write_login_log(f"已自動重登帳號 {acc['username']}")
-                    # 換下一個帳號
-                    idx = (idx + 1) % len(hwnd_keys)
-                    with rotation_countdown_lock:
-                        rotation_countdown = rotation_interval
-                    continue
-                else:
-                    write_login_log(f"帳號 {acc_brief['username']} 畫面正常，標準差={mean_stddev:.2f}")
             except Exception as e:
                 write_login_log(f"畫面異常判斷失敗: {e}")
+                abnormal = False
 
-            # 輪巡倒數等待
+            if abnormal:
+                write_login_log(f"[警告] 帳號 {acc_brief['username']} 畫面異常(全灰?)，標準差={mean_stddev:.2f}，即將自動重登")
+                # 關閉視窗，移除
+                close_window(hwnd)
+                if hwnd in windows_handles:
+                    del windows_handles[hwnd]
+                time.sleep(2)
+                # 暫停輪巡，重登
+                new_hwnd = relogin_account(acc_brief)
+                if new_hwnd is not None:
+                    windows_handles[new_hwnd] = {"username": acc_brief['username']}
+                # 重啟輪巡流程（直接 return，主線程會再呼叫 start_window_rotation）
+                write_login_log("重登流程結束，恢復輪巡")
+                start_window_rotation(list(windows_handles.keys()))
+                return  # 停止目前這個輪巡thread
+            # 輪巡倒數
             idx = (idx + 1) % len(hwnd_keys)
             with rotation_countdown_lock:
                 rotation_countdown = rotation_interval
